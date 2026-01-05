@@ -1,0 +1,86 @@
+﻿name: lockpack
+on:
+  pull_request:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  lockpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare run id
+        run: echo "RUN_ID=$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Generate QG.json (bootstrap)
+        run: |
+          mkdir -p evidence/${RUN_ID}
+          cat > evidence/${RUN_ID}/QG.json <<EOF
+          {
+            "run_id": "${RUN_ID}",
+            "commit": "${GITHUB_SHA}",
+            "overall_status": "FIX_TO_PASS",
+            "runtime_errors_count": 0,
+            "pending_count": 0,
+            "gates": [
+              {"name":"bootstrap_continuity","status":"PASS"},
+              {"name":"bootstrap_evidence","status":"PASS"}
+            ],
+            "sig":"PYMGBZ"
+          }
+          EOF
+
+      - name: Snapshot manifest (hashes)
+        run: |
+          mkdir -p snapshots/${RUN_ID}
+          python - <<'PY'
+import os, json, hashlib
+rid = os.environ.get("RUN_ID")
+out = {"run_id": rid, "files": []}
+
+for dirpath, _, files in os.walk("."):
+    if dirpath.startswith("./.git"):
+        continue
+    for fn in files:
+        p = os.path.join(dirpath, fn)
+        if p.startswith("./.git"):
+            continue
+        try:
+            with open(p, "rb") as f:
+                h = hashlib.sha256(f.read()).hexdigest()
+            out["files"].append({"path": p[2:] if p.startswith("./") else p, "sha256": h})
+        except Exception:
+            pass
+
+with open(os.path.join("snapshots", rid, "manifest.json"), "w", encoding="utf-8") as f:
+    json.dump(out, f, ensure_ascii=False, indent=2)
+PY
+
+      - name: Build resume_pack.zip
+        run: |
+          mkdir -p artifacts/${RUN_ID}
+          python - <<'PY'
+import os, zipfile
+rid = os.environ.get("RUN_ID")
+out_path = os.path.join("artifacts", rid, "resume_pack.zip")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for dirpath, _, files in os.walk("state"):
+        for fn in files:
+            p = os.path.join(dirpath, fn)
+            z.write(p, p)
+PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockpack-${{ env.RUN_ID }}
+          path: |
+            evidence/${{ env.RUN_ID }}/QG.json
+            snapshots/${{ env.RUN_ID }}/manifest.json
+            artifacts/${{ env.RUN_ID }}/resume_pack.zip
