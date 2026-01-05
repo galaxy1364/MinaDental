@@ -13,13 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare run id
-        run: echo "RUN_ID=$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> $GITHUB_ENV
+      - name: Prepare RUN_ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUN_ID=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Generate QG.json (bootstrap)
+        shell: bash
         run: |
-          mkdir -p evidence/${RUN_ID}
-          cat > evidence/${RUN_ID}/QG.json <<EOF
+          set -euo pipefail
+          mkdir -p "evidence/${RUN_ID}"
+          cat > "evidence/${RUN_ID}/QG.json" <<EOF
           {
             "run_id": "${RUN_ID}",
             "commit": "${GITHUB_SHA}",
@@ -35,48 +40,52 @@ jobs:
           EOF
 
       - name: Snapshot manifest (hashes)
+        shell: bash
         run: |
-          mkdir -p snapshots/${RUN_ID}
+          set -euo pipefail
+          mkdir -p "snapshots/${RUN_ID}"
           python - <<'PY'
-import os, json, hashlib
-rid = os.environ.get("RUN_ID")
-out = {"run_id": rid, "files": []}
+          import os, json, hashlib
+          rid = os.environ["RUN_ID"]
+          out = {"run_id": rid, "files": []}
 
-for dirpath, _, files in os.walk("."):
-    if dirpath.startswith("./.git"):
-        continue
-    for fn in files:
-        p = os.path.join(dirpath, fn)
-        if p.startswith("./.git"):
-            continue
-        try:
-            with open(p, "rb") as f:
-                h = hashlib.sha256(f.read()).hexdigest()
-            out["files"].append({"path": p[2:] if p.startswith("./") else p, "sha256": h})
-        except Exception:
-            pass
+          for dirpath, _, files in os.walk("."):
+              if dirpath.startswith("./.git"):
+                  continue
+              for fn in files:
+                  p = os.path.join(dirpath, fn)
+                  if p.startswith("./.git"):
+                      continue
+                  try:
+                      with open(p, "rb") as f:
+                          h = hashlib.sha256(f.read()).hexdigest()
+                      out["files"].append({"path": p[2:] if p.startswith("./") else p, "sha256": h})
+                  except Exception:
+                      pass
 
-with open(os.path.join("snapshots", rid, "manifest.json"), "w", encoding="utf-8") as f:
-    json.dump(out, f, ensure_ascii=False, indent=2)
-PY
+          os.makedirs(os.path.join("snapshots", rid), exist_ok=True)
+          with open(os.path.join("snapshots", rid, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False, indent=2)
+          PY
 
       - name: Build resume_pack.zip
+        shell: bash
         run: |
-          mkdir -p artifacts/${RUN_ID}
+          set -euo pipefail
           python - <<'PY'
-import os, zipfile
-rid = os.environ.get("RUN_ID")
-out_path = os.path.join("artifacts", rid, "resume_pack.zip")
-os.makedirs(os.path.dirname(out_path), exist_ok=True)
+          import os, zipfile
+          rid = os.environ["RUN_ID"]
+          out_path = os.path.join("artifacts", rid, "resume_pack.zip")
+          os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for dirpath, _, files in os.walk("state"):
-        for fn in files:
-            p = os.path.join(dirpath, fn)
-            z.write(p, p)
-PY
+          with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+              for dirpath, _, files in os.walk("state"):
+                  for fn in files:
+                      p = os.path.join(dirpath, fn)
+                      z.write(p, p)
+          PY
 
-      - name: Upload artifact
+      - name: Upload evidence artifacts
         uses: actions/upload-artifact@v4
         with:
           name: lockpack-${{ env.RUN_ID }}
