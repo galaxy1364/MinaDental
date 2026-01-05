@@ -1,0 +1,13 @@
+﻿{
+  "project": "MinaDental (Dental Clinic Management)",
+  "phase": "GATE_1_BOOTSTRAP",
+  "status": "FIX_TO_PASS",
+  "run_id": null,
+  "last_commit": null,
+  "locks": {
+    "lockpack": "NOT_PROVEN",
+    "continuity": "BOOTSTRAPPED",
+    "ios26_ui_locks": "SPEC_LOCKED"
+  },
+  "sig": "PYMGBZ"
+}

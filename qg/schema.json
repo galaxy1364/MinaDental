@@ -1,0 +1,12 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QG.json schema (bootstrap)",
+  "type": "object",
+  "required": ["run_id","overall_status","gates","sig"],
+  "properties": {
+    "run_id": {"type":"string"},
+    "overall_status": {"type":"string"},
+    "gates": {"type":"array"},
+    "sig": {"type":"string"}
+  }
+}
