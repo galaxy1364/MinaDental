@@ -102,7 +102,7 @@ jobs:
           python - <<'PY'
           import os, zipfile
           rid = os.environ["RUN_ID"]
-          evidence_zip = os.environ["EVIDENCE_ZIP"]
+          evidence_zip = f"artifacts/{rid}/lockpack_evidence-{rid}.zip"
           os.makedirs(os.path.dirname(evidence_zip), exist_ok=True)
 
           with zipfile.ZipFile(evidence_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -184,3 +184,4 @@ jobs:
             artifacts/${{ env.RUN_ID }}/attestation_verify.json
             artifacts/${{ env.RUN_ID }}/attestation_bundle.jsonl
             artifacts/${{ env.RUN_ID }}/trusted_root.jsonl
+
