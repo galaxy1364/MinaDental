@@ -130,7 +130,7 @@ jobs:
 
           gh attestation verify "${EVIDENCE_ZIP}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --signer-workflow ".github/workflows/lockpack.yml" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/lockpack.yml" \
             --format json \
             > "artifacts/${RUN_ID}/attestation_verify.json"
 
@@ -185,5 +185,6 @@ jobs:
             artifacts/${{ env.RUN_ID }}/attestation_verify.json
             artifacts/${{ env.RUN_ID }}/attestation_bundle.jsonl
             artifacts/${{ env.RUN_ID }}/trusted_root.jsonl
+
 
 
