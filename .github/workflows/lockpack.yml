@@ -223,18 +223,17 @@ jobs:
       run: |
         set -euo pipefail
 
-        # Rename only attestation bundle files that violate NTFS rules (":" in filename)
         sanitize_dir () {
           d="$1"
           [ -d "$d" ] || return 0
-          find "$d" -maxdepth 2 -type f -name 'sha256:*.jsonl' -print0 | while IFS= read -r -d '' f; do
+          find "$d" -maxdepth 1 -type f -name '*:*' -print0 | while IFS= read -r -d '' f; do
             nf="${f//:/_}"
             echo "rename: $f -> $nf"
             mv "$f" "$nf"
           done
         }
 
-        # Some gh versions write sha256:*.jsonl into workspace root
+        # IMPORTANT: gh may emit sha256:<digest>.jsonl in repo root OR in these dirs
         sanitize_dir "."
         sanitize_dir "evidence/attestations"
         sanitize_dir "artifacts/${RUN_ID}"
