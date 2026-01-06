@@ -192,35 +192,28 @@ jobs:
     - name: Attest build provenance (lockpack_evidence.zip)
       uses: actions/attest-build-provenance@v3
       with:
-        subject-path: ${{ env.EVIDENCE_ZIP }}
+        subject-path: artifacts/${{ env.RUN_ID }}/lockpack_evidence-${{ env.RUN_ID }}.zip
     - name: Download attestation bundle (include as artifact)
       env:
         GH_TOKEN: ${{ github.token }}
-      run: |2
-
+      run: |
         set -euo pipefail
-        ARTIFACT="artifacts/${RUN_ID}/resume_pack.zip"
+
         mkdir -p evidence/attestations
         pushd evidence/attestations >/dev/null
 
-        tmp="$(mktemp)"
-        ok=0
-        for i in 1 2 3 4 5; do
-          if gh attestation download "$GITHUB_WORKSPACE/$ARTIFACT" -R "${GITHUB_REPOSITORY}" > "$tmp"; then
-            if [ -s "$tmp" ]; then
-              mv "$tmp" "attestation_bundle.jsonl"
-            else
-              rm -f "$tmp"
-            fi
-            ok=1
-            break
-          fi
-          sleep 5
+        SUBJECTS=(
+          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/resume_pack.zip"
+          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
+        )
+
+        for s in "${SUBJECTS[@]}"; do
+          echo "Downloading attestation bundle for: $s"
+          gh attestation download --repo "${GITHUB_REPOSITORY}" "$s"
         done
 
-        # If this gh version writes sha256*.jsonl automatically, keep it too (we’re already in evidence/attestations).
-        ls -la
-        test "$ok" -eq 1
+        # Keep trusted root alongside bundles (so upload-artifact picks it up)
+        gh attestation trusted-root > trusted_root.jsonl
 
         popd >/dev/null
     - name: Sanitize attestation filenames (no colon)
