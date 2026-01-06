@@ -1,229 +1,66 @@
-name: lockpack
-
-on:
-  pull_request:
-  push:
-    branches: ["main"]
-
-# Required for OIDC + Artifact Attestations (provenance)
-permissions:
-  contents: read
-  id-token: write
-  attestations: write
-
-jobs:
-  lockpack:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Prepare RUN_ID
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "RUN_ID=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-
-    - name: Snapshot manifest (hashes)
-      shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p "snapshots/${RUN_ID}"
-        python - <<'PY'
-        import os, json, hashlib
-        rid = os.environ["RUN_ID"]
-        out = {"run_id": rid, "files": []}
-
-        for dirpath, _, files in os.walk("."):
-            if dirpath.startswith("./.git"):
-                continue
-            for fn in files:
-                p = os.path.join(dirpath, fn)
-                if p.startswith("./.git"):
-                    continue
-                try:
-                    with open(p, "rb") as f:
-                        h = hashlib.sha256(f.read()).hexdigest()
-                    out["files"].append({"path": p[2:] if p.startswith("./") else p, "sha256": h})
-                except Exception:
-                    pass
-
-        with open(os.path.join("snapshots", rid, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        PY
-
-    - name: Build resume_pack.zip
-      shell: bash
-      run: |
-        set -euo pipefail
-        python - <<'PY'
-        import os, zipfile
-        rid = os.environ["RUN_ID"]
-        out_path = os.path.join("artifacts", rid, "resume_pack.zip")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            for dirpath, _, files in os.walk("state"):
-                for fn in files:
-                    p = os.path.join(dirpath, fn)
-                    z.write(p, p)
-        PY
-
-    - name: Generate QG.json (bootstrap, finalized later)
-      shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p "evidence/${RUN_ID}"
-        cat > "evidence/${RUN_ID}/QG.json" <<EOF
-        {
-          "run_id": "${RUN_ID}",
-          "commit": "${GITHUB_SHA}",
-          "overall_status": "FIX_TO_PASS",
-          "runtime_errors_count": 0,
-          "pending_count": 0,
-          "gates": [
-            {"name":"ruleset_main","status":"PASS"},
-            {"name":"codeowners","status":"PASS"},
-            {"name":"required_check_lockpack","status":"PASS"},
-            {"name":"signed_ci_artifact_provenance","status":"PENDING"}
-          ],
-          "sig":"PYMGBZ"
-        }
-        EOF
-
-    - name: Build evidence bundle zip (subject for provenance)
-      shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p "artifacts/${RUN_ID}"
-
-        EVIDENCE_ZIP="artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
-        echo "EVIDENCE_ZIP=${EVIDENCE_ZIP}" >> "$GITHUB_ENV"
-        export EVIDENCE_ZIP
-
-        python - <<'PY'
-        import os, zipfile
-        rid = os.environ["RUN_ID"]
-        evidence_zip = f"artifacts/{rid}/lockpack_evidence-{rid}.zip"
-        os.makedirs(os.path.dirname(evidence_zip), exist_ok=True)
-
-        with zipfile.ZipFile(evidence_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.write(f"evidence/{rid}/QG.json", f"evidence/{rid}/QG.json")
-            z.write(f"snapshots/{rid}/manifest.json", f"snapshots/{rid}/manifest.json")
-            z.write(f"artifacts/{rid}/resume_pack.zip", f"artifacts/{rid}/resume_pack.zip")
-        PY
-
-        sha="$(sha256sum "$EVIDENCE_ZIP" | awk '{print $1}')"
-        echo "EVIDENCE_ZIP_SHA256=$sha" >> "$GITHUB_ENV"
-
-    - name: Attest build provenance (GitHub Artifact Attestations)
-      uses: actions/attest-build-provenance@v3
-      with:
-        subject-path: ${{ env.EVIDENCE_ZIP }}
-
-    - name: Verify attestation (online)
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        set -euo pipefail
-        mkdir -p "artifacts/${RUN_ID}"
-
-        gh attestation verify "${EVIDENCE_ZIP}" \
-          --repo "${GITHUB_REPOSITORY}" \
-          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/lockpack.yml" \
-          --format json \
-          > "artifacts/${RUN_ID}/attestation_verify.json"
-
-    - name: Download attestation bundle + trusted root (offline evidence)
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |2
-
-        set -euo pipefail
-        mkdir -p "artifacts/${RUN_ID}"
-
-        tmp="$(mktemp)"
-        # Some gh versions print bundle to stdout; others may create sha256*.jsonl in CWD.
-        # Capture stdout if present, and also move any generated sha256*.jsonl files.
-        if gh attestation download "${EVIDENCE_ZIP}" --repo "${GITHUB_REPOSITORY}" > "$tmp"; then
-          if [ -s "$tmp" ]; then
-            mv "$tmp" "artifacts/${RUN_ID}/attestation_bundle.jsonl"
-          else
-            rm -f "$tmp"
-          fi
-        fi
-
-        shopt -s nullglob
-        for f in sha256*.jsonl; do
-          mv "$f" "artifacts/${RUN_ID}/$f"
-        done
-
-        gh attestation trusted-root > "artifacts/${RUN_ID}/trusted_root.jsonl"
-
-    - name: Finalize QG.json (mark provenance PASS)
-      shell: bash
-      run: |
-        set -euo pipefail
-        python - <<'PY'
-        import os, json
-        rid = os.environ["RUN_ID"]
-        p = os.path.join("evidence", rid, "QG.json")
-
-        with open(p, "r", encoding="utf-8") as f:
-            d = json.load(f)
-
-        for g in d.get("gates", []):
-            if g.get("name") == "signed_ci_artifact_provenance":
-                g["status"] = "PASS"
-
-        d["evidence_zip_path"] = os.environ.get("EVIDENCE_ZIP")
-        d["evidence_zip_sha256"] = os.environ.get("EVIDENCE_ZIP_SHA256")
-        d["pending_count"] = 0
-
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        PY
-
     - name: Attest build provenance (resume_pack.zip)
       uses: actions/attest-build-provenance@v3
       with:
         subject-path: artifacts/${{ env.RUN_ID }}/resume_pack.zip
-    - name: Download attestation bundle (include as artifact)
+
+    - name: Attest build provenance (lockpack_evidence.zip)
+      uses: actions/attest-build-provenance@v3
+      with:
+        subject-path: artifacts/${{ env.RUN_ID }}/lockpack_evidence-${{ env.RUN_ID }}.zip
+
+    - name: Download attestation bundles (resume + evidence) + trusted root (include as artifact)
+      shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-      run: |2
-
-        set -euo pipefail
-        ARTIFACT="artifacts/${RUN_ID}/resume_pack.zip"
-        mkdir -p evidence/attestations
-        pushd evidence/attestations >/dev/null
-
-        tmp="$(mktemp)"
-        ok=0
-        for i in 1 2 3 4 5; do
-          if gh attestation download "$GITHUB_WORKSPACE/$ARTIFACT" -R "${GITHUB_REPOSITORY}" > "$tmp"; then
-            if [ -s "$tmp" ]; then
-              mv "$tmp" "attestation_bundle.jsonl"
-            else
-              rm -f "$tmp"
-            fi
-            ok=1
-            break
-          fi
-          sleep 5
-        done
-
-        # If this gh version writes sha256*.jsonl automatically, keep it too (we’re already in evidence/attestations).
-        ls -la
-        test "$ok" -eq 1
-
-        popd >/dev/null
-    - name: Sanitize attestation filenames (no colon)
       run: |
         set -euo pipefail
 
-        # Remove ":" from filenames so upload-artifact won't fail (NTFS-safe)
+        mkdir -p evidence/attestations
+        pushd evidence/attestations >/dev/null
+
+        SUBJECTS=(
+          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/resume_pack.zip"
+          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
+        )
+
+        for s in "${SUBJECTS[@]}"; do
+          echo "Downloading attestation bundle for: $s"
+          d="$(sha256sum "$s" | awk '{print $1}')"
+
+          tmp="$(mktemp)"
+          ok=0
+          for i in 1 2 3 4 5; do
+            if gh attestation download --repo "${GITHUB_REPOSITORY}" "$s" >"$tmp"; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          test "$ok" -eq 1
+
+          found=0
+          for cand in "sha256_${d}.jsonl" "sha256-${d}.jsonl" "sha256:${d}.jsonl"; do
+            [ -f "$cand" ] && found=1
+          done
+
+          if [ "$found" -eq 0 ]; then
+            test -s "$tmp"
+            mv "$tmp" "sha256_${d}.jsonl"
+          else
+            rm -f "$tmp"
+          fi
+        done
+
+        gh attestation trusted-root > trusted_root.jsonl
+        ls -la
+
+        popd >/dev/null
+
+    - name: Sanitize attestation filenames (no colon)
+      shell: bash
+      run: |
+        set -euo pipefail
+
         sanitize_dir () {
           d="$1"
           [ -d "$d" ] || return 0
@@ -234,14 +71,17 @@ jobs:
           done
         }
 
+        sanitize_dir "."
         sanitize_dir "evidence/attestations"
         sanitize_dir "artifacts/${RUN_ID}"
+
     - name: Upload attestation bundle
       uses: actions/upload-artifact@v4
       with:
         name: lockpack-attestations
         path: evidence/attestations/*.jsonl
         if-no-files-found: error
+
     - name: Upload evidence artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -254,8 +94,6 @@ jobs:
           artifacts/${{ env.RUN_ID }}/attestation_verify.json
           artifacts/${{ env.RUN_ID }}/attestation_bundle.jsonl
           artifacts/${{ env.RUN_ID }}/trusted_root.jsonl
-
-
 
     permissions:
       contents: read
