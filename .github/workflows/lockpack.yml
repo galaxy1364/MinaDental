@@ -189,6 +189,10 @@ jobs:
       uses: actions/attest-build-provenance@v3
       with:
         subject-path: artifacts/${{ env.RUN_ID }}/resume_pack.zip
+    - name: Attest build provenance (lockpack_evidence.zip)
+      uses: actions/attest-build-provenance@v3
+      with:
+        subject-path: ${{ env.EVIDENCE_ZIP }}
     - name: Download attestation bundle (include as artifact)
       env:
         GH_TOKEN: ${{ github.token }}
