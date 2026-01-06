@@ -219,6 +219,23 @@ jobs:
         test "$ok" -eq 1
 
         popd >/dev/null
+    - name: Sanitize attestation filenames (no colon)
+      run: |
+        set -euo pipefail
+
+        # Remove ":" from filenames so upload-artifact won't fail (NTFS-safe)
+        sanitize_dir () {
+          d="$1"
+          [ -d "$d" ] || return 0
+          find "$d" -maxdepth 1 -type f -name '*:*' -print0 | while IFS= read -r -d '' f; do
+            nf="${f//:/_}"
+            echo "rename: $f -> $nf"
+            mv "$f" "$nf"
+          done
+        }
+
+        sanitize_dir "evidence/attestations"
+        sanitize_dir "artifacts/${RUN_ID}"
     - name: Upload attestation bundle
       uses: actions/upload-artifact@v4
       with:
