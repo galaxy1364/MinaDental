@@ -98,6 +98,7 @@ jobs:
 
           EVIDENCE_ZIP="artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
           echo "EVIDENCE_ZIP=${EVIDENCE_ZIP}" >> "$GITHUB_ENV"
+          export EVIDENCE_ZIP
 
           python - <<'PY'
           import os, zipfile
@@ -184,4 +185,5 @@ jobs:
             artifacts/${{ env.RUN_ID }}/attestation_verify.json
             artifacts/${{ env.RUN_ID }}/attestation_bundle.jsonl
             artifacts/${{ env.RUN_ID }}/trusted_root.jsonl
+
 
