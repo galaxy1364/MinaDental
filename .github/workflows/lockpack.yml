@@ -2,7 +2,8 @@ name: lockpack
 
 on:
   pull_request:
-    branches: [ main ]          # Required Check همیشه status بگیرد
+    branches: [ main ]
+  merge_group: {}
   push:
     branches: [ main ]
     paths:
@@ -11,9 +12,11 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+  statuses: write
   id-token: write
   attestations: write
-  artifact-metadata: write      # لازم/پیشنهادی برای storage record :contentReference[oaicite:3]{index=3}
+  artifact-metadata: write
 
 concurrency:
   group: lockpack-${{ github.workflow }}-${{ github.ref }}
@@ -26,37 +29,33 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # فقط برای PR: آیا lockpack.yml تغییر کرده؟
-      - name: Detect relevant change
-        id: changed
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            lockpack:
-              - ".github/workflows/lockpack.yml"
-
-      # اگر PR ربطی به lockpack.yml ندارد، سریع PASS بده (برای رفع Expected)
-      - name: No-op (required check satisfied)
-        if: ${{ github.event_name == 'pull_request' && steps.changed.outputs.lockpack != 'true' }}
+      # --- GUARANTEED STATUS (context: lockpack) ---
+      - name: Set status = pending (lockpack)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "lockpack: not applicable for this PR (workflow file unchanged)."
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=pending \
+            -f context="lockpack" \
+            -f description="LOCKPACK running (GATE 2)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-      # از اینجا به بعد فقط وقتی lockpack.yml تغییر کرده یا push/dispatch است
       - name: Init RUN_ID
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           echo "RUN_ID=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "SIG=PYMGBZ" >> "$GITHUB_ENV"
 
-      # BUILD bootstrap: واقعی می‌سازد تا pipeline قطعاً کار کند
-      - name: Build evidence + resume packs (bootstrap)
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
+      - name: Build evidence + snapshot + resume (bootstrap)
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +64,7 @@ jobs:
             sudo apt-get install -y zip
           fi
 
-          mkdir -p "evidence/${RUN_ID}" "resume/${RUN_ID}"
+          mkdir -p "evidence/${RUN_ID}" "snapshots/${RUN_ID}" "resume/${RUN_ID}"
 
           cat > "evidence/${RUN_ID}/QG.json" <<EOF
           {
@@ -74,7 +73,7 @@ jobs:
             "overall_status": "FIX_TO_PASS",
             "runtime_errors_count": 0,
             "pending_count": 0,
-            "sig": "PYM JBZ"
+            "sig": "${SIG}"
           }
           EOF
 
@@ -83,27 +82,32 @@ jobs:
           from pathlib import Path
           run_id = os.environ["RUN_ID"]
           root = Path("evidence")/run_id
+          snap = Path("snapshots")/run_id
+          snap.mkdir(parents=True, exist_ok=True)
+
           def sha256(p: Path):
             h=hashlib.sha256()
             with p.open("rb") as f:
               for ch in iter(lambda:f.read(1024*1024), b""):
                 h.update(ch)
             return h.hexdigest()
+
           files = sorted([p for p in root.rglob("*") if p.is_file()])
           manifest = {"run_id": run_id, "sha256": {str(p.relative_to(root)).replace("\\","/"): sha256(p) for p in files}}
           (root/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+          (snap/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
           PY
 
-          echo "LOCKPACK RESUME (bootstrap) run_id=${RUN_ID} commit=${GITHUB_SHA}" > "resume/${RUN_ID}/resume.txt"
+          echo "LOCKPACK RESUME run_id=${RUN_ID} commit=${GITHUB_SHA}" > "resume/${RUN_ID}/resume.txt"
 
           ( cd "evidence/${RUN_ID}" && zip -X -r "../../lockpack_evidence-${RUN_ID}.zip" . )
           ( cd "resume/${RUN_ID}"   && zip -X -r "../../resume_pack.zip" . )
 
           test -f "lockpack_evidence-${RUN_ID}.zip"
           test -f "resume_pack.zip"
+          test -f "snapshots/${RUN_ID}/manifest.json"
 
       - name: Locate outputs
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -113,41 +117,33 @@ jobs:
           echo "EVIDENCE_ZIP=$EVID" >> "$GITHUB_ENV"
           echo "RESUME_ZIP=resume_pack.zip" >> "$GITHUB_ENV"
 
-      - name: Attest evidence
+      - name: Attest evidence (provenance)
         id: attest_evidence
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ env.EVIDENCE_ZIP }}
 
-      - name: Attest resume
+      - name: Attest resume (provenance)
         id: attest_resume
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ env.RESUME_ZIP }}
 
-      # قطعی و استاندارد: bundle-path خروجی action را نگه می‌داریم + trusted_root
-      - name: Prepare offline bundles (trusted_root + action bundles) + offline verify
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
+      - name: Prepare offline bundles + offline verify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p lockpack-attestations
-
-          gh --version
-          gh attestation trusted-root > trusted_root.jsonl  # :contentReference[oaicite:4]{index=4}
+          gh attestation trusted-root > trusted_root.jsonl
 
           EVID_DIGEST="$(sha256sum "${EVIDENCE_ZIP}" | awk '{print $1}')"
           RESUME_DIGEST="$(sha256sum "${RESUME_ZIP}" | awk '{print $1}')"
 
-          # actions/attest-build-provenance خروجی bundle-path می‌دهد :contentReference[oaicite:5]{index=5}
           cp "${{ steps.attest_evidence.outputs.bundle-path }}" "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl"
           cp "${{ steps.attest_resume.outputs.bundle-path }}"   "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl"
 
-          # اثبات قطعی داخل CI (offline mode): verify با --bundle و --custom-trusted-root :contentReference[oaicite:6]{index=6}
           gh attestation verify "${EVIDENCE_ZIP}" --repo "${GITHUB_REPOSITORY}" \
             --bundle "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl" \
             --custom-trusted-root trusted_root.jsonl --format json > /dev/null
@@ -156,21 +152,57 @@ jobs:
             --bundle "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl" \
             --custom-trusted-root trusted_root.jsonl --format json > /dev/null
 
-      - name: Upload attestations
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: lockpack-attestations
-          path: lockpack-attestations
+      - name: Write run summary (attestation URLs)
+        shell: bash
+        run: |
+          {
+            echo "## LOCKPACK — GATE 2 (Signed CI Artifact + Provenance)"
+            echo "- RUN_ID: \`${RUN_ID}\`"
+            echo "- Evidence attestation: ${{ steps.attest_evidence.outputs.attestation-url }}"
+            echo "- Resume attestation: ${{ steps.attest_resume.outputs.attestation-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload payload
-        if: ${{ github.event_name != 'pull_request' || steps.changed.outputs.lockpack == 'true' }}
+      - name: Upload payload (evidence + snapshot + bundles)
         uses: actions/upload-artifact@v4
         with:
           name: lockpack-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
           path: |
             ${{ env.EVIDENCE_ZIP }}
             ${{ env.RESUME_ZIP }}
             trusted_root.jsonl
+            lockpack-attestations/
             evidence/${{ env.RUN_ID }}/QG.json
             evidence/${{ env.RUN_ID }}/manifest.json
+            snapshots/${{ env.RUN_ID }}/manifest.json
+
+      # --- FINAL STATUS (success) ---
+      - name: Set status = success (lockpack)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=success \
+            -f context="lockpack" \
+            -f description="LOCKPACK PASS (GATE 2)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      # --- FINAL STATUS (failure) ---
+      - name: Set status = failure (lockpack)
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=failure \
+            -f context="lockpack" \
+            -f description="LOCKPACK FAIL (see Actions run)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
