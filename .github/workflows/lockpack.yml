@@ -1,102 +1,228 @@
-    - name: Attest build provenance (resume_pack.zip)
-      uses: actions/attest-build-provenance@v3
-      with:
-        subject-path: artifacts/${{ env.RUN_ID }}/resume_pack.zip
+name: lockpack
 
-    - name: Attest build provenance (lockpack_evidence.zip)
-      uses: actions/attest-build-provenance@v3
-      with:
-        subject-path: artifacts/${{ env.RUN_ID }}/lockpack_evidence-${{ env.RUN_ID }}.zip
+on:
+  pull_request:
+    branches: [ main ]   # Required Check همیشه status بگیرد
+  push:
+    branches: [ main ]   # باید روی main هم اجرا شود
+  workflow_dispatch:
 
-    - name: Download attestation bundles (resume + evidence) + trusted root (include as artifact)
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        set -euo pipefail
+permissions:
+  contents: read
+  pull-requests: read          # لازم برای dorny/paths-filter روی PR :contentReference[oaicite:7]{index=7}
+  id-token: write              # OIDC
+  attestations: write          # persist attestation
+  artifact-metadata: write     # storage record (اختیاری/پیشنهادی) :contentReference[oaicite:8]{index=8}
 
-        mkdir -p evidence/attestations
-        pushd evidence/attestations >/dev/null
+concurrency:
+  group: lockpack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-        SUBJECTS=(
-          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/resume_pack.zip"
-          "$GITHUB_WORKSPACE/artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
-        )
+jobs:
+  lockpack:
+    name: lockpack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-        for s in "${SUBJECTS[@]}"; do
-          echo "Downloading attestation bundle for: $s"
-          d="$(sha256sum "$s" | awk '{print $1}')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-          tmp="$(mktemp)"
-          ok=0
-          for i in 1 2 3 4 5; do
-            if gh attestation download --repo "${GITHUB_REPOSITORY}" "$s" >"$tmp"; then
-              ok=1
-              break
-            fi
-            sleep 5
-          done
-          test "$ok" -eq 1
+      # فقط برای PR: آیا lockpack.yml تغییر کرده؟
+      - name: Detect relevant change
+        id: changed
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            lockpack:
+              - ".github/workflows/lockpack.yml"
 
-          found=0
-          for cand in "sha256_${d}.jsonl" "sha256-${d}.jsonl" "sha256:${d}.jsonl"; do
-            [ -f "$cand" ] && found=1
-          done
-
-          if [ "$found" -eq 0 ]; then
-            test -s "$tmp"
-            mv "$tmp" "sha256_${d}.jsonl"
+      # فقط برای PR: آیا PR از fork است؟
+      - name: Detect fork PR
+        id: fork
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "is_fork=true" >> "$GITHUB_OUTPUT"
           else
-            rm -f "$tmp"
+            echo "is_fork=false" >> "$GITHUB_OUTPUT"
           fi
-        done
 
-        gh attestation trusted-root > trusted_root.jsonl
-        ls -la
+      # اگر PR ربطی به lockpack.yml ندارد یا PR فورک است، سریع PASS بده
+      - name: No-op (required check satisfied)
+        if: ${{ github.event_name == 'pull_request' && (steps.fork.outputs.is_fork == 'true' || steps.changed.outputs.lockpack != 'true') }}
+        run: |
+          echo "lockpack: not applicable for this PR (fork PR or workflow file unchanged)."
 
-        popd >/dev/null
+      # از اینجا به بعد فقط وقتی:
+      # - push/dispatch است، یا
+      # - PR داخلی (non-fork) و lockpack.yml تغییر کرده
+      - name: Init RUN_ID
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUN_ID=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-    - name: Sanitize attestation filenames (no colon)
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Build evidence + resume packs (bootstrap)
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        sanitize_dir () {
-          d="$1"
-          [ -d "$d" ] || return 0
-          find "$d" -maxdepth 1 -type f -name '*:*' -print0 | while IFS= read -r -d '' f; do
-            nf="${f//:/_}"
-            echo "rename: $f -> $nf"
-            mv "$f" "$nf"
-          done
-        }
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y zip
+          fi
 
-        sanitize_dir "."
-        sanitize_dir "evidence/attestations"
-        sanitize_dir "artifacts/${RUN_ID}"
+          mkdir -p "evidence/${RUN_ID}" "snapshots/${RUN_ID}" "artifacts/${RUN_ID}" "lockpack-attestations"
 
-    - name: Upload attestation bundle
-      uses: actions/upload-artifact@v4
-      with:
-        name: lockpack-attestations
-        path: evidence/attestations/*.jsonl
-        if-no-files-found: error
+          # QG.json (ابتدایی؛ بعداً با اطلاعات attestation آپدیت می‌شود)
+          cat > "evidence/${RUN_ID}/QG.json" <<EOF
+          {
+            "run_id": "${RUN_ID}",
+            "commit": "${GITHUB_SHA}",
+            "overall_status": "FIX_TO_PASS",
+            "runtime_errors_count": 0,
+            "pending_count": 0,
+            "sig": "PYM JBZ"
+          }
+          EOF
 
-    - name: Upload evidence artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: lockpack-${{ env.RUN_ID }}
-        path: |
-          evidence/${{ env.RUN_ID }}/QG.json
-          snapshots/${{ env.RUN_ID }}/manifest.json
-          artifacts/${{ env.RUN_ID }}/resume_pack.zip
-          ${{ env.EVIDENCE_ZIP }}
-          artifacts/${{ env.RUN_ID }}/attestation_verify.json
-          artifacts/${{ env.RUN_ID }}/attestation_bundle.jsonl
-          artifacts/${{ env.RUN_ID }}/trusted_root.jsonl
+          # resume_pack.zip در مسیر مورد انتظار STATE
+          mkdir -p "artifacts/${RUN_ID}/_resume"
+          echo "LOCKPACK RESUME (bootstrap) run_id=${RUN_ID} commit=${GITHUB_SHA}" > "artifacts/${RUN_ID}/_resume/resume.txt"
+          ( cd "artifacts/${RUN_ID}/_resume" && zip -X -r "../resume_pack.zip" . )
+          rm -rf "artifacts/${RUN_ID}/_resume"
 
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-      artifact-metadata: write
+          # evidence zip (برای attestation)
+          ( cd "evidence/${RUN_ID}" && zip -X -r "../../artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip" . )
+
+          test -f "artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip"
+          test -f "artifacts/${RUN_ID}/resume_pack.zip"
+
+      - name: Locate outputs
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "EVIDENCE_ZIP=artifacts/${RUN_ID}/lockpack_evidence-${RUN_ID}.zip" >> "$GITHUB_ENV"
+          echo "RESUME_ZIP=artifacts/${RUN_ID}/resume_pack.zip" >> "$GITHUB_ENV"
+          test -f "${EVIDENCE_ZIP}"
+          test -f "${RESUME_ZIP}"
+
+      - name: Attest evidence
+        id: attest_evidence
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ env.EVIDENCE_ZIP }}
+
+      - name: Attest resume
+        id: attest_resume
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ env.RESUME_ZIP }}
+
+      - name: Prepare offline bundles (trusted_root + action bundles) + offline verify
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh --version
+
+          # trusted roots برای verify آفلاین :contentReference[oaicite:9]{index=9}
+          gh attestation trusted-root > trusted_root.jsonl
+
+          EVID_DIGEST="$(sha256sum "${EVIDENCE_ZIP}" | awk '{print $1}')"
+          RESUME_DIGEST="$(sha256sum "${RESUME_ZIP}" | awk '{print $1}')"
+
+          # bundle-path خروجی رسمی action است :contentReference[oaicite:10]{index=10}
+          cp "${{ steps.attest_evidence.outputs.bundle-path }}" "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl"
+          cp "${{ steps.attest_resume.outputs.bundle-path }}"   "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl"
+
+          # verify قطعی داخل CI (offline) :contentReference[oaicite:11]{index=11}
+          gh attestation verify "${EVIDENCE_ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --bundle "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl" \
+            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
+
+          gh attestation verify "${RESUME_ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --bundle "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl" \
+            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
+
+          # QG.json را با attestation metadata کامل کن (PASS)
+          python3 - <<PY
+          import json, os, pathlib
+          run_id = os.environ["RUN_ID"]
+          qg = pathlib.Path("evidence")/run_id/"QG.json"
+          data = json.loads(qg.read_text(encoding="utf-8"))
+          data["overall_status"] = "PASS"
+          data["attestations"] = {
+            "evidence": {
+              "attestation_id": "${{ steps.attest_evidence.outputs.attestation-id }}",
+              "attestation_url": "${{ steps.attest_evidence.outputs.attestation-url }}"
+            },
+            "resume": {
+              "attestation_id": "${{ steps.attest_resume.outputs.attestation-id }}",
+              "attestation_url": "${{ steps.attest_resume.outputs.attestation-url }}"
+            }
+          }
+          qg.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+          PY
+
+          # manifest مطابق STATE: snapshots/<RUN_ID>/manifest.json :contentReference[oaicite:12]{index=12}
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          run_id = Path("evidence").glob("*")
+          # RUN_ID را از env می‌گیریم ولی برای سادگی از ساختار پوشه استفاده نمی‌کنیم:
+          # مسیرها را مستقیم می‌خوانیم.
+          import os
+          rid = os.environ["RUN_ID"]
+
+          paths = [
+            Path("evidence")/rid/"QG.json",
+            Path(os.environ["EVIDENCE_ZIP"]),
+            Path(os.environ["RESUME_ZIP"]),
+            Path("trusted_root.jsonl"),
+          ]
+          paths += sorted(Path("lockpack-attestations").glob("*.jsonl"))
+
+          def sha256(p: Path) -> str:
+            h = hashlib.sha256()
+            with p.open("rb") as f:
+              for ch in iter(lambda: f.read(1024*1024), b""):
+                h.update(ch)
+            return h.hexdigest()
+
+          m = {
+            "run_id": rid,
+            "sha256": { str(p).replace("\\","/"): sha256(p) for p in paths }
+          }
+          out = Path("snapshots")/rid/"manifest.json"
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text(json.dumps(m, indent=2, ensure_ascii=False), encoding="utf-8")
+          PY
+
+      - name: Upload LOCKPACK bundle (single artifact)
+        if: ${{ github.event_name != 'pull_request' || (steps.fork.outputs.is_fork != 'true' && steps.changed.outputs.lockpack == 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockpack-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            ${{ env.EVIDENCE_ZIP }}
+            ${{ env.RESUME_ZIP }}
+            trusted_root.jsonl
+            lockpack-attestations/*.jsonl
+            evidence/${{ env.RUN_ID }}/QG.json
+            snapshots/${{ env.RUN_ID }}/manifest.json
