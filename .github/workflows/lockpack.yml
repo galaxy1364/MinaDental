@@ -1,29 +1,68 @@
-﻿name: lockpack
+name: lockpack
+
 on:
   pull_request:
+    branches: [ main ]
+  merge_group: {}
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
+  statuses: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: lockpack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lockpack:
+    name: lockpack
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
 
-      - name: Prepare RUN_ID
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Guaranteed Status Context = "lockpack"
+      - name: Set status = pending (lockpack)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=pending \
+            -f context="lockpack" \
+            -f description="LOCKPACK running (GATE 2)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Init RUN_ID
         shell: bash
         run: |
           set -euo pipefail
           echo "RUN_ID=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "SIG=PYMGBZ" >> "$GITHUB_ENV"
 
-      - name: Generate QG.json (bootstrap)
+      - name: Build evidence + snapshot + resume
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "evidence/${RUN_ID}"
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y zip
+          fi
+
+          mkdir -p "evidence/${RUN_ID}" "snapshots/${RUN_ID}" "resume/${RUN_ID}"
+
           cat > "evidence/${RUN_ID}/QG.json" <<EOF
           {
             "run_id": "${RUN_ID}",
@@ -31,66 +70,134 @@ jobs:
             "overall_status": "FIX_TO_PASS",
             "runtime_errors_count": 0,
             "pending_count": 0,
-            "gates": [
-              {"name":"bootstrap_continuity","status":"PASS"},
-              {"name":"bootstrap_evidence","status":"PASS"}
-            ],
-            "sig":"PYMGBZ"
+            "sig": "${SIG}"
           }
           EOF
 
-      - name: Snapshot manifest (hashes)
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          run_id = os.environ["RUN_ID"]
+          root = Path("evidence")/run_id
+          snap = Path("snapshots")/run_id
+          snap.mkdir(parents=True, exist_ok=True)
+
+          def sha256(p: Path):
+              h=hashlib.sha256()
+              with p.open("rb") as f:
+                  for ch in iter(lambda:f.read(1024*1024), b""):
+                      h.update(ch)
+              return h.hexdigest()
+
+          files = sorted([p for p in root.rglob("*") if p.is_file()])
+          manifest = {"run_id": run_id, "sha256": {str(p.relative_to(root)).replace("\\","/"): sha256(p) for p in files}}
+          (root/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+          (snap/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+          PY
+
+          echo "LOCKPACK RESUME run_id=${RUN_ID} commit=${GITHUB_SHA}" > "resume/${RUN_ID}/resume.txt"
+
+          ( cd "evidence/${RUN_ID}" && zip -X -r "../../lockpack_evidence-${RUN_ID}.zip" . )
+          ( cd "resume/${RUN_ID}" && zip -X -r "../../resume_pack.zip" . )
+
+          test -f "lockpack_evidence-${RUN_ID}.zip"
+          test -f "resume_pack.zip"
+          test -f "snapshots/${RUN_ID}/manifest.json"
+
+      - name: Locate outputs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "snapshots/${RUN_ID}"
-          python - <<'PY'
-          import os, json, hashlib
-          rid = os.environ["RUN_ID"]
-          out = {"run_id": rid, "files": []}
+          EVID="lockpack_evidence-${RUN_ID}.zip"
+          test -f "$EVID"
+          test -f "resume_pack.zip"
+          echo "EVIDENCE_ZIP=$EVID" >> "$GITHUB_ENV"
+          echo "RESUME_ZIP=resume_pack.zip" >> "$GITHUB_ENV"
 
-          for dirpath, _, files in os.walk("."):
-              if dirpath.startswith("./.git"):
-                  continue
-              for fn in files:
-                  p = os.path.join(dirpath, fn)
-                  if p.startswith("./.git"):
-                      continue
-                  try:
-                      with open(p, "rb") as f:
-                          h = hashlib.sha256(f.read()).hexdigest()
-                      out["files"].append({"path": p[2:] if p.startswith("./") else p, "sha256": h})
-                  except Exception:
-                      pass
+      - name: Attest evidence (provenance)
+        id: attest_evidence
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ env.EVIDENCE_ZIP }}
 
-          os.makedirs(os.path.join("snapshots", rid), exist_ok=True)
-          with open(os.path.join("snapshots", rid, "manifest.json"), "w", encoding="utf-8") as f:
-              json.dump(out, f, ensure_ascii=False, indent=2)
-          PY
+      - name: Attest resume (provenance)
+        id: attest_resume
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ env.RESUME_ZIP }}
 
-      - name: Build resume_pack.zip
+      - name: Prepare offline bundles + offline verify
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os, zipfile
-          rid = os.environ["RUN_ID"]
-          out_path = os.path.join("artifacts", rid, "resume_pack.zip")
-          os.makedirs(os.path.dirname(out_path), exist_ok=True)
+          mkdir -p lockpack-attestations
+          gh attestation trusted-root > trusted_root.jsonl
 
-          with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-              for dirpath, _, files in os.walk("state"):
-                  for fn in files:
-                      p = os.path.join(dirpath, fn)
-                      z.write(p, p)
-          PY
+          EVID_DIGEST="$(sha256sum "${EVIDENCE_ZIP}" | awk '{print $1}')"
+          RESUME_DIGEST="$(sha256sum "${RESUME_ZIP}" | awk '{print $1}')"
 
-      - name: Upload evidence artifacts
+          cp "${{ steps.attest_evidence.outputs.bundle-path }}" "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl"
+          cp "${{ steps.attest_resume.outputs.bundle-path }}" "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl"
+
+          gh attestation verify "${EVIDENCE_ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --bundle "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl" \
+            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
+
+          gh attestation verify "${RESUME_ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --bundle "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl" \
+            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
+
+      - name: Write run summary (attestation URLs)
+        shell: bash
+        run: |
+          {
+            echo "## LOCKPACK — GATE 2 (Signed CI Artifact + Provenance)"
+            echo "- RUN_ID: \`${RUN_ID}\`"
+            echo "- Evidence attestation: ${{ steps.attest_evidence.outputs.attestation-url }}"
+            echo "- Resume attestation: ${{ steps.attest_resume.outputs.attestation-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload payload (evidence + snapshot + bundles)
         uses: actions/upload-artifact@v4
         with:
-          name: lockpack-${{ env.RUN_ID }}
+          name: lockpack-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
           path: |
+            ${{ env.EVIDENCE_ZIP }}
+            ${{ env.RESUME_ZIP }}
+            trusted_root.jsonl
+            lockpack-attestations/
             evidence/${{ env.RUN_ID }}/QG.json
+            evidence/${{ env.RUN_ID }}/manifest.json
             snapshots/${{ env.RUN_ID }}/manifest.json
-            artifacts/${{ env.RUN_ID }}/resume_pack.zip
 
+      - name: Set status = success (lockpack)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=success \
+            -f context="lockpack" \
+            -f description="LOCKPACK PASS (GATE 2)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Set status = failure (lockpack)
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=failure \
+            -f context="lockpack" \
+            -f description="LOCKPACK FAIL (see Actions run)" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
