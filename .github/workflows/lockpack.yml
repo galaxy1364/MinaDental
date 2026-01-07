@@ -34,15 +34,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # --- GUARANTEED STATUS (context: lockpack) ---
-      - name: Set status = pending (lockpack)
+      - name: Set commit status pending (lockpack)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          SHA="${GITHUB_SHA}"
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
             -f state=pending \
             -f context="lockpack" \
             -f description="LOCKPACK running (GATE 2)" \
@@ -59,6 +57,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if ! command -v zip >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y zip
@@ -80,20 +79,25 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
+
           run_id = os.environ["RUN_ID"]
           root = Path("evidence")/run_id
           snap = Path("snapshots")/run_id
           snap.mkdir(parents=True, exist_ok=True)
 
           def sha256(p: Path):
-            h=hashlib.sha256()
+            h = hashlib.sha256()
             with p.open("rb") as f:
-              for ch in iter(lambda:f.read(1024*1024), b""):
+              for ch in iter(lambda: f.read(1024*1024), b""):
                 h.update(ch)
             return h.hexdigest()
 
           files = sorted([p for p in root.rglob("*") if p.is_file()])
-          manifest = {"run_id": run_id, "sha256": {str(p.relative_to(root)).replace("\\","/"): sha256(p) for p in files}}
+          manifest = {
+            "run_id": run_id,
+            "sha256": {str(p.relative_to(root)).replace("\\","/"): sha256(p) for p in files}
+          }
+
           (root/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
           (snap/"manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
           PY
@@ -111,11 +115,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          EVID="lockpack_evidence-${RUN_ID}.zip"
-          test -f "$EVID"
-          test -f "resume_pack.zip"
-          echo "EVIDENCE_ZIP=$EVID" >> "$GITHUB_ENV"
+          echo "EVIDENCE_ZIP=lockpack_evidence-${RUN_ID}.zip" >> "$GITHUB_ENV"
           echo "RESUME_ZIP=resume_pack.zip" >> "$GITHUB_ENV"
+          test -f "${EVIDENCE_ZIP}"
+          test -f "${RESUME_ZIP}"
 
       - name: Attest evidence (provenance)
         id: attest_evidence
@@ -129,40 +132,7 @@ jobs:
         with:
           subject-path: ${{ env.RESUME_ZIP }}
 
-      - name: Prepare offline bundles + offline verify
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p lockpack-attestations
-          gh attestation trusted-root > trusted_root.jsonl
-
-          EVID_DIGEST="$(sha256sum "${EVIDENCE_ZIP}" | awk '{print $1}')"
-          RESUME_DIGEST="$(sha256sum "${RESUME_ZIP}" | awk '{print $1}')"
-
-          cp "${{ steps.attest_evidence.outputs.bundle-path }}" "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl"
-          cp "${{ steps.attest_resume.outputs.bundle-path }}"   "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl"
-
-          gh attestation verify "${EVIDENCE_ZIP}" --repo "${GITHUB_REPOSITORY}" \
-            --bundle "lockpack-attestations/sha256_${EVID_DIGEST}.jsonl" \
-            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
-
-          gh attestation verify "${RESUME_ZIP}" --repo "${GITHUB_REPOSITORY}" \
-            --bundle "lockpack-attestations/sha256_${RESUME_DIGEST}.jsonl" \
-            --custom-trusted-root trusted_root.jsonl --format json > /dev/null
-
-      - name: Write run summary (attestation URLs)
-        shell: bash
-        run: |
-          {
-            echo "## LOCKPACK — GATE 2 (Signed CI Artifact + Provenance)"
-            echo "- RUN_ID: \`${RUN_ID}\`"
-            echo "- Evidence attestation: ${{ steps.attest_evidence.outputs.attestation-url }}"
-            echo "- Resume attestation: ${{ steps.attest_resume.outputs.attestation-url }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload payload (evidence + snapshot + bundles)
+      - name: Upload payload (evidence + snapshot)
         uses: actions/upload-artifact@v4
         with:
           name: lockpack-${{ github.run_id }}
@@ -171,38 +141,27 @@ jobs:
           path: |
             ${{ env.EVIDENCE_ZIP }}
             ${{ env.RESUME_ZIP }}
-            trusted_root.jsonl
-            lockpack-attestations/
             evidence/${{ env.RUN_ID }}/QG.json
             evidence/${{ env.RUN_ID }}/manifest.json
             snapshots/${{ env.RUN_ID }}/manifest.json
 
-      # --- FINAL STATUS (success) ---
-      - name: Set status = success (lockpack)
-        if: ${{ success() }}
+      - name: Final commit status (lockpack)
+        if: ${{ always() }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          SHA="${GITHUB_SHA}"
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
-            -f state=success \
-            -f context="lockpack" \
-            -f description="LOCKPACK PASS (GATE 2)" \
-            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ "${{ job.status }}" == "success" ]]; then
+            STATE="success"
+            DESC="LOCKPACK PASS (GATE 2)"
+          else
+            STATE="failure"
+            DESC="LOCKPACK FAIL (see Actions run)"
+          fi
 
-      # --- FINAL STATUS (failure) ---
-      - name: Set status = failure (lockpack)
-        if: ${{ failure() }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          SHA="${GITHUB_SHA}"
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
-            -f state=failure \
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state="${STATE}" \
             -f context="lockpack" \
-            -f description="LOCKPACK FAIL (see Actions run)" \
+            -f description="${DESC}" \
             -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
